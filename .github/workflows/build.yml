@@ -1,0 +1,74 @@
+name: Build VoiceOver Fix (Windows)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ekstrak zip
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem -Path . -Filter "VoiceOverFix-Windows*.zip" | Select-Object -First 1
+          if (-not $zip) { throw "VoiceOverFix-Windows.zip tidak ada di halaman utama repo" }
+          Expand-Archive -Path $zip.FullName -DestinationPath src -Force
+          $main = Get-ChildItem -Path src -Recurse -Filter voiceoverfix.py | Select-Object -First 1
+          if (-not $main) { throw "voiceoverfix.py tidak ditemukan di dalam zip" }
+          "APPDIR=$($main.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build whisper-cli.exe dari whisper.cpp
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git whisper.cpp
+          cmake -S whisper.cpp -B whisper.cpp/build -A x64 `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_OPENMP=OFF `
+            -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF `
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure gagal" }
+          cmake --build whisper.cpp/build --config Release --target whisper-cli -j 4
+          if ($LASTEXITCODE -ne 0) { throw "cmake build gagal" }
+          $cli = Get-ChildItem whisper.cpp/build -Recurse -Filter whisper-cli.exe | Select-Object -First 1
+          if (-not $cli) { throw "whisper-cli.exe tidak ditemukan" }
+          New-Item -ItemType Directory -Force -Path stage/bin | Out-Null
+          Copy-Item $cli.FullName stage/bin/whisper-cli.exe
+          Get-ChildItem $cli.DirectoryName -Filter *.dll | Copy-Item -Destination stage/bin
+
+      - name: Install paket Python + ambil ffmpeg.exe
+        shell: pwsh
+        run: |
+          Set-Location $env:APPDIR
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller imageio-ffmpeg
+          if ($LASTEXITCODE -ne 0) { throw "pip install gagal" }
+          python -c "import imageio_ffmpeg, shutil, os; shutil.copy(imageio_ffmpeg.get_ffmpeg_exe(), os.path.join(os.environ['GITHUB_WORKSPACE'], 'stage', 'bin', 'ffmpeg.exe'))"
+          if ($LASTEXITCODE -ne 0) { throw "gagal menyalin ffmpeg" }
+          & "$env:GITHUB_WORKSPACE/stage/bin/ffmpeg.exe" -version | Select-Object -First 1
+          & "$env:GITHUB_WORKSPACE/stage/bin/whisper-cli.exe" --help 2>&1 | Select-Object -First 3
+          exit 0
+
+      - name: Bungkus jadi aplikasi Windows (PyInstaller)
+        shell: pwsh
+        run: |
+          Set-Location $env:APPDIR
+          pyinstaller --noconfirm --clean --windowed --onedir --name VoiceOverFix --icon icon.ico --add-data "icon.ico;." --collect-all rapidfuzz --collect-submodules pypdf voiceoverfix.py
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller gagal" }
+          $dist = Join-Path $env:APPDIR "dist/VoiceOverFix"
+          Copy-Item -Recurse -Force "$env:GITHUB_WORKSPACE/stage/bin" "$dist/bin"
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE/release" | Out-Null
+          Copy-Item -Recurse -Force $dist "$env:GITHUB_WORKSPACE/release/VoiceOverFix"
+          Get-ChildItem "$env:GITHUB_WORKSPACE/release/VoiceOverFix" | Select-Object Name
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VoiceOverFix-Windows
+          path: release
